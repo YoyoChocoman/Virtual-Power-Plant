@@ -14,18 +14,23 @@ example:
 
 -------------------------------------------------------------------------
 
+
+
+-------------------------------------------------------------------------
+
 Periodic Task (週期性用電需求)
 1. hard deadline
 2. 週期性
-
-Sporadic Task (偶發性用電需求)
-1. hard deadline
-2. 非週期性
 
 Aperiodic Task (非週期性用電需求)
 1. soft deadline
 2. 非週期性
 3. if miss, then calculate miss 與遲延時間 (tardiness)
+
+Sporadic Task (偶發性用電需求)
+1. hard deadline
+2. 非週期性
+
 
 Non-preemptive (不可中斷)
 preemptive = 0
