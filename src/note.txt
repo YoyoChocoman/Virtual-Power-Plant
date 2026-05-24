@@ -1,0 +1,55 @@
+Task
+r: release time
+p: period time
+e: excuted time
+d: relative deadline
+w: 需要能量
+preempt: 0 / 1
+
+example:
+"p1": {"r": 1, "p": 12, "e": 3, "d": 10, "w": 15, "preempt": 1}
+[1, 10] 選 3 個時段有工作 (不用連續)
+[13, 22] 選 3 個時段有工作 (不用連續)
+...
+
+-------------------------------------------------------------------------
+
+Periodic Task (週期性用電需求)
+1. hard deadline
+2. 週期性
+
+Sporadic Task (偶發性用電需求)
+1. hard deadline
+2. 非週期性
+
+Aperiodic Task (非週期性用電需求)
+1. soft deadline
+2. 非週期性
+3. if miss, then calculate miss 與遲延時間 (tardiness)
+
+Non-preemptive (不可中斷)
+preemptive = 0
+J_np
+
+Preemptive (可中斷)
+preemptive = 1
+
+-------------------------------------------------------------------------
+
+Periodic Task: 已知
+Sporadic Task: 不修改 Periodic 插入 Sporadic，要做 Acceptance test
+Aperiodic jobs: 不做 Acceptance test
+
+-------------------------------------------------------------------------
+
+{
+    "aperiodic": {
+        "a1": {"r": 1, "e": 3, "w": 15, "d": 15, "preempt": 1},
+        "a2": {"r": 3, "e": 4, "w": 10, "d": 10, "preempt": 1},
+        "a3": {"r": 5, "e": 4, "w": 12, "d": 12, "preempt": 0}
+    },
+    "sporadic": {
+        "s1": {"r": 1, "e": 3, "d": 10, "w": 15, "preempt": 1},
+        "s2": {"r": 3, "e": 4, "d": 15, "w": 10, "preempt": 1}
+    }
+ }

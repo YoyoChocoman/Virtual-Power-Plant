@@ -70,5 +70,6 @@ for i in range(tasks):
         "preempt": preemp[i]
     }
 
+
 with open("../output/task_set.json", "w", encoding="utf-8") as f:
     json.dump(data, f, ensure_ascii=False, indent=4)
