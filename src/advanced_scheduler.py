@@ -12,7 +12,6 @@ with open("../input/price_72hr.json", "r", encoding="utf-8") as f:
     prices = json.load(f)
 
 SHIFT = 0
-
 jobs_periodic_dict = {}
 for task, info in data["periodic"].items():
     for i in range(72 // info["p"]):
@@ -243,7 +242,7 @@ def Constraint_13():
                 actual_pv = base_forecast * random.uniform(0.1, 0.3)
                 cloud -= 1
             else:
-                actual_pv = base_forecast * random.unimform(0.85, 1.15)
+                actual_pv = base_forecast * random.uniform(0.85, 1.15)
                 if random.random() < 0.05:
                     cloud += random.randint(1, 3)
                     actual_pv = base_forecast * random.uniform(0.1, 0.3)
@@ -466,7 +465,8 @@ print(f"\n總結:接受了 {len(accepted_sporadic)} 個，拒絕了 {len(rejecte
 lost_revenue = 0
 for j in accepted_sporadic:
     for t in sporadic_allocations[j]:
-        lost_revenue += jobs_all_dict[j]["w"] * price_dict[t]
+        #改成浮動市場價格
+        lost_revenue += jobs_all_dict[j]["w"] * rt_price_dict[t]
 
 final_revenue = actual_f3 - lost_revenue
 final_objective = value(BIG_LP.objective) + lost_revenue
