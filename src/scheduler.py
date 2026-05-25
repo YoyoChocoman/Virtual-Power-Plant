@@ -2,7 +2,7 @@ import json
 from pulp import *
 
 with open("../output/task_set.json", "r", encoding="utf-8") as f:
-    data = json.load(f)
+    task_data = json.load(f)
 
 with open("../input/processor_settings.json", "r", encoding="utf-8") as f:
     processors = json.load(f)
@@ -13,11 +13,11 @@ with open("../input/price_72hr.json", "r", encoding="utf-8") as f:
 SHIFT = 0
 
 jobs_periodic_dict = {}
-for task, info in data["periodic"].items():
+for task, info in task_data["periodic"].items():
     for i in range(72 // info["p"]):
         if info["r"] + info["p"] * i + info["d"] > 72: break
 
-        jobs_periodic_dict[f"{task}_{i + 1}"] = {
+        jobs_periodic_dict[f"{task}_{i}"] = {
             "r": info["r"] + info["p"] * i + SHIFT,
             "d": info["r"] + info["p"] * i + info["d"] + SHIFT,
             "e": info["e"],
@@ -25,8 +25,8 @@ for task, info in data["periodic"].items():
             "preempt": info["preempt"]
         }
 
-jobs_aperiodic_dict = data.get("aperiodic", {})
-for task, info in data.get("aperiodic", {}).items():
+jobs_aperiodic_dict = task_data.get("aperiodic", {})
+for task, info in task_data.get("aperiodic", {}).items():
     jobs_aperiodic_dict[task] = {
         "r": info["r"] + SHIFT,
         "d": info["r"] + info["d"] + SHIFT, # 轉為 absolute deadline
@@ -36,7 +36,7 @@ for task, info in data.get("aperiodic", {}).items():
     }
 
 jobs_sporadic_dict = {}
-for task, info in data.get("sporadic", {}).items():
+for task, info in task_data.get("sporadic", {}).items():
     jobs_sporadic_dict[task] = {
         "r": info["r"] + SHIFT,
         "d": info["r"] + info["d"] + SHIFT, # 轉為 absolute deadline
@@ -89,6 +89,10 @@ is_chg = LpVariable.dicts("is_chg", (I_b, T), cat="Binary")
 
 # is_gen_on[i][t]: 設備 i 在時間 t 是否啟動 (Binary 0 或 1)
 is_gen_on = LpVariable.dicts("ON", (I_g, T), cat="Binary")
+
+#2 電力保留缺口
+Shortfall = LpVariable.dicts("Reserved", T, lowBound=0, cat="Continuous")
+
 
 def Constraint_1():
     # 若用電需求 𝑗 在時間點 𝑡 用電，則獲得的總電能量必須為 𝑤_j
@@ -239,6 +243,7 @@ def Constraint_11_12():
         if tn > 0 and tn < ut:
             remain_up = ut - tn
             for t in range(1, remain_up + 1):
+            # for t in range(1, min(remain_up, 72) + 1):
                 BIG_LP += (is_gen_on[i][t] == 1, f"Force_Initial_Up_{i}_t{t}")
 
         # Constraint 12: 已經關機，但還沒滿足最小關機時間
@@ -375,6 +380,14 @@ def Constraint_22_23():
         # 發出來的電 = 任務吃掉 + 剩下拿去 Sell 的
         BIG_LP += (total_generated == total_consumed + SELL[t], f"System_Energy_Balance_t{t}")
 
+# 新加的 強制保留電
+def Constraint_24():
+    global BIG_LP
+    reserved_battery = 20
+
+    for t in T:
+        BIG_LP += (SELL[t] + Shortfall[t] >= reserved_battery, f"Soft_Reserved_t{t}")
+
 Constraint_1()
 Constraint_2()
 Constraint_3()
@@ -388,6 +401,7 @@ Constraint_16_to_19()
 Constraint_20()
 Constraint_21()
 Constraint_22_23()
+Constraint_24()
 
 # 發電機成本資料
 gen_costs = {g["generator_id"]: {"fixed": g["cost_fixed"], "var": g["cost_variable"]} for g in processors["generator"]}
@@ -404,7 +418,10 @@ f2 = lpSum(gen_costs[i]["fixed"] * is_gen_on[i][t] + gen_costs[i]["var"] * P[i][
 # 目標 3：最大化售電收益 (因為是最小化問題，所以前面要加負號)
 f3 = -lpSum(price_dict[t] * SELL[t] for t in T)
 
-BIG_LP += f1 + f2 + f3, "Total_Objective"
+# 目標 4：盡可能保持SELL非0以保證隨時有多餘的電可以應付sporadic
+penalty = lpSum(Shortfall[t] * 1000 for t in T)
+
+BIG_LP += f1 + f2 + f3 + penalty, "Total_Objective"
 
 # 開始求解
 print("模型建置完成，開始求解...")
@@ -444,53 +461,125 @@ print("\n--- 開始執行 Sporadic 任務 Acceptance Test ---")
 # 取得每個小時的剩餘資源 (原本要賣掉的電)
 slack = {t: SELL[t].varValue for t in T}
 
-accepted_sporadic = []
-rejected_sporadic = []
-sporadic_allocations = {} # 紀錄被接受的 Sporadic 任務分配在哪些時段
+J_sporadic_list = list(J_sporadic)
+max_time = -1
+best_accepted = []
+best_allocations = {}
 
-for j in J_sporadic:
-    r = jobs_all_dict[j]["r"]
-    d = jobs_all_dict[j]["d"]
-    e = jobs_all_dict[j]["e"]
-    w = jobs_all_dict[j]["w"]
-    is_preempt = jobs_all_dict[j]["preempt"]
+def dfs(idx, current_slack, current_accepted, current_allocations, current_time):
+    global max_time, best_accepted, best_allocations
+    # 邊界條件：已經走完所有 sporadic 任務
+    if idx == len(J_sporadic_list):
+        if current_time > max_time:
+            max_time = current_time
+            best_accepted = list(current_accepted)
+            best_allocations = dict(current_allocations)
+        return
 
+    job_id = J_sporadic_list[idx]
+    job = jobs_all_dict[job_id]
+    r, d, e, w, is_preempt = job["r"], job["d"], job["e"], job["w"], job["preempt"]
     valid_end = min(d, 73)
+
+    # 選擇 1：不選此任務，直接往下走
+    dfs(idx + 1, current_slack, current_accepted, current_allocations, current_time)
+
+   # 選擇 2：選此任務（先檢查可用資源是否足夠排滿 e 小時，並挑選最便宜的時段）
     available_hours = []
 
-    # 找可用時段 (該時段的 slack 必須 >= 任務所需電量 w)
     if is_preempt == 1:
-        # 在區間內湊齊 e 個小時即可
-        for t in range(r, valid_end):
-            if slack[t] >= w:
-                available_hours.append(t)
-            if len(available_hours) == e:
-                break
-    else:
-        # 必須找到連續的 e 個小時
-        consecutive_count = 0
-        temp_hours = []
-        for t in range(r, valid_end):
-            if slack[t] >= w:
-                consecutive_count += 1
-                temp_hours.append(t)
-                if consecutive_count == e:
-                    available_hours = temp_hours.copy()
-                    break
-            else:
-                consecutive_count = 0
-                temp_hours = []
+        # preemptive: 找出所有容量足夠的時段
+        valid_slots = [t for t in range(r, valid_end) if current_slack[t] >= w]
 
-    # 判斷 Accept 或 Reject
-    if len(available_hours) == e:
-        accepted_sporadic.append(j)
-        sporadic_allocations[j] = available_hours
-        for t in available_hours:
-            slack[t] -= w
-        print(f"[Accept] 接受任務 {j}，安排於時段 {available_hours}")
+        if len(valid_slots) >= e:
+            # 💡 核心優化：依照該時段的市場電價 (price_dict) 由低到高排序
+            valid_slots.sort(key=lambda t: price_dict[t])
+            # 挑選最便宜的 e 個小時
+            available_hours = valid_slots[:e]
+
     else:
-        rejected_sporadic.append(j)
-        print(f"[Reject] 拒絕任務 {j}")
+        # non-preemptive: 必須找到連續的 e 個小時，並找出總成本最低的區塊
+        valid_blocks = []
+        temp_block = []
+
+        for t in range(r, valid_end):
+            if current_slack[t] >= w:
+                temp_block.append(t)
+                # 如果收集到的連續時段長度達到 e，這就是一個合法區塊
+                if len(temp_block) >= e:
+                    valid_blocks.append(temp_block[-e:])
+            else:
+                temp_block = [] # 中斷了，重新計算
+
+        if valid_blocks:
+            # 💡 核心優化：計算每個合法區塊的總電價，並挑選總價最低的那個區塊
+            available_hours = min(valid_blocks, key=lambda block: sum(price_dict[t] for t in block))
+
+    # 如果可以順利排滿 e 個小時，則進入「選此任務」的分支
+    if len(available_hours) == e:
+        new_slack = current_slack.copy()
+        for t in available_hours:
+            new_slack[t] -= w
+
+        new_allocations = current_allocations.copy()
+        new_allocations[job_id] = available_hours
+        new_accepted = current_accepted + [job_id]
+
+        dfs(idx + 1, new_slack, new_accepted, new_allocations, current_time + e)
+
+# 啟動枚舉
+dfs(0, slack.copy(), [], {}, 0)
+
+# 將最佳解套用至全域結果
+accepted_sporadic = best_accepted
+sporadic_allocations = best_allocations
+rejected_sporadic = [j for j in J_sporadic_list if j not in accepted_sporadic]
+
+# 更新全域的 slack 資源，扣除被最佳組合消耗的電量
+for j in accepted_sporadic:
+    for t in sporadic_allocations[j]:
+        slack[t] -= jobs_all_dict[j]["w"]
+
+# 計算財報
+lost_revenue = 0
+for j in accepted_sporadic:
+    for t in sporadic_allocations[j]:
+        lost_revenue += jobs_all_dict[j]["w"] * price_dict[t]
+
+final_revenue = actual_f3 - lost_revenue
+final_objective = value(BIG_LP.objective) + lost_revenue
+
+# 建立輸出日誌結構
+acceptance_log = {
+    "summary": {
+        "accepted_count": len(accepted_sporadic),
+        "rejected_count": len(rejected_sporadic),
+        "max_accepted_time_hours": max_time
+    },
+    "tasks_detail": {},
+    "financials": {
+        "original_expected_revenue": actual_f3,
+        "lost_revenue_due_to_sporadic": lost_revenue,
+        "final_actual_revenue": final_revenue,
+        "final_total_objective": final_objective
+    }
+}
+
+for j in J_sporadic_list:
+    if j in accepted_sporadic:
+        acceptance_log["tasks_detail"][j] = {
+            "status": "Accept",
+            "allocated_hours": sporadic_allocations[j]
+        }
+    else:
+        acceptance_log["tasks_detail"][j] = {
+            "status": "Reject",
+            "allocated_hours": []
+        }
+
+# 寫入 JSON 檔案
+with open("../output/acceptance_test_log.json", "w", encoding="utf-8") as f:
+    json.dump(acceptance_log, f, ensure_ascii=False, indent=4)
 
 print(f"\n總結:接受了 {len(accepted_sporadic)} 個，拒絕了 {len(rejected_sporadic)} 個 Sporadic 任務。")
 
@@ -506,30 +595,77 @@ print("\n--- 最終財報結算 (包含 Sporadic 影響) ---")
 print(f"原本預期售電收益: {actual_f3}")
 print(f"因接受 Sporadic 犧牲的售電收益: {lost_revenue}")
 print(f"最終實際售電收益: {final_revenue}")
-print(f"最終總目標函數值: {final_objective}")
+print(f"最終總目標函數值(利潤): {final_objective}")
 
-# 輸出排程結果至 JSON
+
+
+# ==========================================
+# 1. 盤點每個時間點各設備的「真實剩餘電量」(原本要拿去 Sell 的電)
+# ==========================================
+leftover_power = {t: {} for t in T}
+for t in T:
+    for i in I_all:
+        gen_val = P[i][t].varValue or 0.0
+        # 計算這個設備已經分配給既有任務 (Periodic, Aperiodic, Charging) 的電量
+        consumed_val = sum((K[j][i][t].varValue or 0.0) for j in J_all)
+
+        remain = gen_val - consumed_val
+        if remain > 1e-4:  # 加上浮點數容差，避免 0.000000001 被算進去
+            leftover_power[t][i] = remain
+
+# ==========================================
+# 2. 輸出排程結果至 JSON 並分配 Sporadic 的來源
+# ==========================================
 schedule_result = []
 
 for t in T:
-    # 發電量 P
-    P_dict = {i: round(P[i][t].varValue, 2) for i in I_all}
+    # 發電量 P (過濾掉沒有發電的設備)
+    P_dict = {i: round(P[i][t].varValue, 2) for i in I_all if (P[i][t].varValue or 0.0) > 1e-4}
 
-    # 電量分配 k (只紀錄大於 0 的分配)
+    # 電量分配 k (既有任務)
     k_dict = {}
     for j in J_all:
-        allocations = {i: round(K[j][i][t].varValue, 2) for i in I_all if K[j][i][t].varValue > 0}
+        allocations = {i: round(K[j][i][t].varValue, 2) for i in I_all if (K[j][i][t].varValue or 0.0) > 1e-4}
         if allocations:
-            k_dict[j] = allocations
+            # 如果是週期性任務，還原名稱（去除後綴的 _{i}），其餘任務保持原樣
+            base_j = j.rsplit('_', 1)[0] if j in J_periodic else j
 
-    # Accept 的 Sporadic 任務
+            # 初始化該任務的字典（若不存在）
+            if base_j not in k_dict:
+                k_dict[base_j] = {}
+
+            # 累加供電量，避免多個實例在同一個時間點 t 供電時發生覆寫
+            for src, val in allocations.items():
+                k_dict[base_j][src] = round(k_dict[base_j].get(src, 0.0) + val, 2)
+
+    # Accept 的 Sporadic 任務 (分配具體發電機)
     for j in accepted_sporadic:
-        if t in sporadic_allocations[j]:
-            k_dict[j] = {"slack_reserve": jobs_all_dict[j]["w"]}
+        if t in sporadic_allocations.get(j, []):
+            w_needed = jobs_all_dict[j]["w"]
+            k_dict[j] = {}
 
-    # 賣的錢, 電量狀態
-    sell_val = round(slack[t], 2)
-    soc_dict = {i: round(SOC[i][t].varValue, 2) for i in I_b}
+            # 從有剩餘電量的設備中「倒水」給這個 Sporadic job
+            for src in list(leftover_power[t].keys()):
+                if w_needed <= 1e-4:
+                    break # 任務需要的電湊齊了就停
+
+                avail = leftover_power[t][src]
+                take = min(w_needed, avail) # 取「還需要的電」與「這台發電機剩的電」的最小值
+
+                # 這裡就會確實標上發電機的名字 (例如 "thermal_1": 15)
+                k_dict[j][src] = round(take, 2)
+
+                # 扣除已經拿走的電量
+                leftover_power[t][src] -= take
+                w_needed -= take
+
+                # 如果這台發電機的剩餘電量被這任務吸乾了，就從可用名單移除
+                if leftover_power[t][src] <= 1e-4:
+                    del leftover_power[t][src]
+
+    # 更新賣出的錢 (剩下的 leftover 全部加總就是實際能賣的電)
+    sell_val = round(sum(leftover_power[t].values()), 2)
+    soc_dict = {i: round(SOC[i][t].varValue or 0.0, 2) for i in I_b}
 
     time_slot = {
         "t": t,
