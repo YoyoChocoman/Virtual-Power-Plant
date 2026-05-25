@@ -1,5 +1,7 @@
 import json
 
+
+
 with open("../output/task_set.json", "r", encoding="utf-8") as f:
     tasks_data = json.load(f)
 with open("../output/schedule_result.json", "r", encoding="utf-8") as f:
@@ -38,6 +40,8 @@ for task, info in tasks_data.get("sporadic", {}).items():
         "e": info["e"], "w": info["w"]
     }
 
+
+
 # 列出所有任務完成時間
 complete_times = {}
 for j in jobs_info.keys():
@@ -47,12 +51,21 @@ for data in schedule_data:
     t = data["t"]
     k = data.get("k", {})
     for j in k.keys():
+        # 1. 如果是 aperiodic 或 sporadic，名稱完全對應 (如 "a1", "s1")
         if j in complete_times:
-            complete_times[j] = t
+            complete_times[j] = max(complete_times[j], t)
+
+        # 2. 如果是基礎週期性任務名稱 (如 "p1")
+        elif j in periodic_groups:
+            # 遍歷該任務旗下的所有週期實例 (如 p1_1, p1_2, p1_3)
+            for job_id in periodic_groups[j]:
+                # 透過時間點 t 是否落在該實例的相對時間區間 [r, d] 內來精準對位
+                if jobs_info[job_id]["r"] <= t <= jobs_info[job_id]["d"]:
+                    complete_times[job_id] = max(complete_times[job_id], t)
 
 # 以下做評估
 # 1. Hard Deadline Miss Rate
-hard_jobs = [j for j, info in jobs_info.items() if info["type"] == ["periodic"]]
+hard_jobs = [j for j, info in jobs_info.items() if info["type"] == "periodic"]
 hard_miss = 0
 for j in hard_jobs:
     if complete_times[j] == -1 or complete_times[j] > jobs_info[j]["d"]:
@@ -89,7 +102,7 @@ for task, jobs in periodic_groups.items():
     rt = []
     for j in jobs:
         if complete_times[j] != -1:
-            rt.append(complete_times[j] - jobs[j]["r"])
+            rt.append(complete_times[j] - jobs_info[j]["r"])
 
     if len(rt) > 1:
         jitter.append(max(rt) - min(rt))
